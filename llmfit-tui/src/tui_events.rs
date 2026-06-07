@@ -291,7 +291,7 @@ fn handle_search_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Left => app.search_cursor_left(),
         KeyCode::Right => app.search_cursor_right(),
 
-        KeyCode::Char(c) => app.search_input(c),
+        KeyCode::Char(c) if allows_search_text_input(key.modifiers) => app.search_input(c),
 
         // Allow navigation while searching
         KeyCode::Up => app.move_up(),
@@ -327,6 +327,16 @@ fn handle_provider_popup_mode(app: &mut App, key: KeyEvent) {
 
         _ => {}
     }
+}
+
+fn allows_search_text_input(modifiers: KeyModifiers) -> bool {
+    !modifiers.intersects(
+        KeyModifiers::CONTROL
+            | KeyModifiers::ALT
+            | KeyModifiers::SUPER
+            | KeyModifiers::HYPER
+            | KeyModifiers::META,
+    )
 }
 
 fn handle_plan_mode(app: &mut App, key: KeyEvent) {
@@ -701,5 +711,31 @@ fn handle_benchmarks_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Char('r') => app.bench_refresh(),
         KeyCode::Char('H') => app.open_bench_hw_picker(),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_text_accepts_unmodified_and_shift_modified_input() {
+        assert!(allows_search_text_input(KeyModifiers::NONE));
+        assert!(allows_search_text_input(KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn search_text_rejects_modified_navigation_artifacts() {
+        assert!(!allows_search_text_input(KeyModifiers::ALT));
+        assert!(!allows_search_text_input(KeyModifiers::SUPER));
+        assert!(!allows_search_text_input(KeyModifiers::CONTROL));
+        assert!(!allows_search_text_input(KeyModifiers::META));
+        assert!(!allows_search_text_input(KeyModifiers::HYPER));
+        assert!(!allows_search_text_input(
+            KeyModifiers::ALT | KeyModifiers::SHIFT
+        ));
+        assert!(!allows_search_text_input(
+            KeyModifiers::SUPER | KeyModifiers::SHIFT
+        ));
     }
 }
