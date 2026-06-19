@@ -1191,7 +1191,8 @@ def _build_first_page_url(pipeline: str, sort: str, page_size: int) -> str:
         f"direction=-1&"
         f"limit={page_size}&"
         f"expand[]=safetensors&"
-        f"expand[]=config"
+        f"expand[]=config&"
+        f"expand[]=cardData"
     )
 
 
@@ -1430,7 +1431,7 @@ def _build_discovered_model(listing: dict) -> dict | None:
     """Build model dict from a listing returned by discover_trending_models.
 
     Only fetches config.json for accurate context length; all other metadata
-    comes from the listing data already obtained via expand=safetensors.
+    comes from the listing data already obtained via expand fields.
     """
     repo_id = listing["id"]
     total_params = listing["_total_params"]
@@ -1458,8 +1459,7 @@ def _build_discovered_model(listing: dict) -> dict | None:
     # Architecture metadata for the precise KV cache formula.
     arch_meta = extract_arch_metadata(full_config)
 
-    license_info = fetch_model_info(repo_id) or listing
-    license_name = extract_license(license_info)
+    license_name = extract_license(listing)
 
     model = {
         "name": repo_id,

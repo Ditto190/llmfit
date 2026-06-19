@@ -648,10 +648,20 @@ impl std::fmt::Display for KvQuant {
 /// Returns true if a model's license matches any in the comma-separated filter string.
 /// Models without a license never match.
 pub fn matches_license_filter(license: &Option<String>, filter: &str) -> bool {
-    let allowed: Vec<String> = filter.split(',').map(|s| s.trim().to_lowercase()).collect();
+    let allowed: Vec<String> = filter
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+
     license
         .as_ref()
-        .map(|l| allowed.contains(&l.to_lowercase()))
+        .map(|licenses| {
+            licenses
+                .split(',')
+                .map(|s| s.trim().to_lowercase())
+                .any(|license| allowed.contains(&license))
+        })
         .unwrap_or(false)
 }
 
@@ -1429,6 +1439,17 @@ fn infer_heads_from_name(name: &str, params_b: f64) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_matches_license_filter_handles_comma_separated_model_licenses() {
+        let license = Some("apache-2.0,mit".to_string());
+
+        assert!(matches_license_filter(&license, "apache-2.0"));
+        assert!(matches_license_filter(&license, "mit"));
+        assert!(matches_license_filter(&license, "bsd-3-clause,mit"));
+        assert!(!matches_license_filter(&license, "cc-by-nc-4.0"));
+        assert!(!matches_license_filter(&None, "mit"));
+    }
 
     // ────────────────────────────────────────────────────────────────────
     // Quantization function tests
