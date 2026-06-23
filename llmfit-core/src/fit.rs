@@ -1480,14 +1480,14 @@ fn fit_score(required: f64, available: f64) -> f64 {
         return 0.0;
     }
     let ratio = required / available;
-    // Smooth Gaussian centered on the ~65% utilization sweet spot. The old step
-    // function jumped 100 -> 70 at the 80% boundary, so a model at 79% scored
-    // 100 and one at 81% scored 70. A bell curve removes those cliffs: scores
-    // fall off gradually on both sides, peaking where the model fills memory
-    // efficiently without crowding it.
-    const CENTER: f64 = 0.65;
+    // Headroom is good: anything that fits with room to spare is a perfect fit,
+    // so the score holds a flat 100 up to a comfortable utilization, then eases
+    // down as memory gets tight via a one-sided Gaussian falloff. This removes
+    // the old step function's 100 -> 70 cliff at 80% (79% scored 100, 81%
+    // scored 70) without penalizing models that leave headroom.
+    const COMFORT: f64 = 0.70;
     const SIGMA: f64 = 0.20;
-    let z = (ratio - CENTER) / SIGMA;
+    let z = ((ratio - COMFORT) / SIGMA).max(0.0);
     (100.0 * (-0.5 * z * z).exp()).clamp(0.0, 100.0)
 }
 
@@ -1885,26 +1885,22 @@ mod tests {
 
     #[test]
     fn test_fit_score_sweet_spot() {
-        // Peaks at ~65% utilization and stays near the top close to it.
-        let peak = fit_score(6.5, 10.0);
-        assert!((peak - 100.0).abs() < 0.01);
+        // Comfortable utilization (room to spare) is a perfect fit.
+        assert!((fit_score(6.5, 10.0) - 100.0).abs() < 0.01); // 65%
+        assert!((fit_score(6.0, 10.0) - 100.0).abs() < 0.01); // 60%
 
-        let score = fit_score(6.0, 10.0); // 60% -- just below the peak
-        assert!(score >= 95.0);
-
-        // 80% used to be a flat 100; the smooth curve eases it down instead of
-        // holding 100 right up to the 80% cliff.
-        let score2 = fit_score(8.0, 10.0);
-        assert!(score2 > 70.0 && score2 < peak);
+        // Past the comfort point the smooth curve eases down instead of holding
+        // a flat 100 right up to the old 80% cliff.
+        let score2 = fit_score(8.0, 10.0); // 80%
+        assert!(score2 > 70.0 && score2 < 100.0);
     }
 
     #[test]
     fn test_fit_score_under_utilized() {
-        // Under-utilizing wastes memory, so it scores well below the sweet spot
-        // (the symmetric bell falls off on the low side too).
-        let score = fit_score(2.0, 10.0); // 20% utilization
-        assert!(score < fit_score(5.0, 10.0));
-        assert!(score < 30.0);
+        // Plenty of headroom is a good thing, not waste -- it stays a perfect
+        // fit rather than being penalized.
+        assert!((fit_score(2.0, 10.0) - 100.0).abs() < 0.01); // 20%
+        assert!((fit_score(5.0, 10.0) - 100.0).abs() < 0.01); // 50%
     }
 
     #[test]
