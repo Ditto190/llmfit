@@ -356,6 +356,7 @@ MOE_ACTIVE_PARAMS = {
     "nc-ai-consortium/VAETKI-VL-7B-A1B": 1_200_000_000,
 }
 
+# Model card lists 32k context; config.json exposes max_position_embeddings=131072.
 CONTEXT_LENGTH_OVERRIDES = {
     "NC-AI-consortium-VAETKI/VAETKI": 32_768,
 }
