@@ -23,6 +23,7 @@ use llmfit_core::hardware::SystemSpecs;
 use llmfit_core::models::ModelDatabase;
 use llmfit_core::plan::{PlanRequest, estimate_model_plan, resolve_model_selector};
 use llmfit_core::quality;
+use llmfit_core::share;
 
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
     let parsed = value
@@ -823,6 +824,19 @@ AGENT USAGE:
         /// Skip specific models by name substring (comma-separated)
         #[arg(long)]
         skip: Option<String>,
+
+        /// Contribute results back to the project as a GitHub pull request
+        /// (no `gh` CLI required; authenticates via the GitHub device flow)
+        #[arg(long)]
+        share: bool,
+
+        /// With --share, print the submission payload and exit without contacting GitHub
+        #[arg(long)]
+        dry_run: bool,
+
+        /// With --share, skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -2018,6 +2032,7 @@ fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_bench(
     model: Option<String>,
     provider: &str,
@@ -2025,6 +2040,8 @@ fn run_bench(
     runs: u32,
     all: bool,
     json: bool,
+    share_opts: Option<share::ShareOptions>,
+    overrides: &HardwareOverrides,
 ) {
     let runs = runs as usize;
 
@@ -2098,6 +2115,9 @@ fn run_bench(
                 "results": results,
             });
             println!("{}", serde_json::to_string_pretty(&json_out).unwrap());
+        }
+        if let Some(opts) = share_opts {
+            share_bench_results(&results, overrides, opts);
         }
         return;
     }
@@ -2203,9 +2223,33 @@ fn run_bench(
             } else {
                 r.display();
             }
+            if let Some(opts) = share_opts {
+                share_bench_results(std::slice::from_ref(&r), overrides, opts);
+            }
         }
         Err(e) => {
             eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Detect hardware and contribute benchmark results upstream via `share`.
+fn share_bench_results(
+    results: &[bench::BenchResult],
+    overrides: &HardwareOverrides,
+    opts: share::ShareOptions,
+) {
+    if results.is_empty() {
+        eprintln!("  Nothing to share: no successful benchmark results.");
+        return;
+    }
+    let specs = detect_specs(overrides);
+    match share::share_results(results, &specs, &opts) {
+        Ok(Some(url)) => println!("\n  Pull request opened: {url}"),
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("  Share failed: {e}");
             std::process::exit(1);
         }
     }
@@ -2905,9 +2949,13 @@ fn main() {
                 roles,
                 quality_config,
                 skip,
+                share,
+                dry_run,
+                yes,
             } => {
                 // No model/flags → launch bench TUI view
-                let is_bare = model.is_none() && !all && !json && !quality && !routing;
+                let is_bare =
+                    model.is_none() && !all && !json && !quality && !routing && !share;
                 if is_bare {
                     if let Err(e) = run_tui_bench(&overrides, context_limit, cli.api_key) {
                         eprintln!("Error running bench TUI: {}", e);
@@ -2926,7 +2974,11 @@ fn main() {
                         skip,
                     );
                 } else {
-                    run_bench(model, &provider, url, runs, all, json);
+                    let share_opts = share.then_some(share::ShareOptions {
+                        dry_run,
+                        assume_yes: yes,
+                    });
+                    run_bench(model, &provider, url, runs, all, json, share_opts, &overrides);
                 }
             }
         }
