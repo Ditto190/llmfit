@@ -1771,6 +1771,14 @@ impl LmStudioProvider {
         )
     }
 
+    fn download_status_url(&self, job_id: &str) -> String {
+        format!(
+            "{}/api/v1/models/download/status/{}",
+            self.base_url.trim_end_matches('/'),
+            job_id
+        )
+    }
+
     /// Single-pass startup probe.
     /// Returns `(available, installed_models, count)`.
     pub fn detect_with_installed(&self) -> (bool, HashSet<String>, usize) {
@@ -1826,13 +1834,16 @@ struct LmStudioModel {
 #[derive(serde::Deserialize)]
 struct LmStudioDownloadResponse {
     #[serde(default)]
-    #[allow(dead_code)]
     job_id: Option<String>,
     #[serde(default)]
     status: String,
     #[serde(default)]
     #[allow(dead_code)]
     total_size_bytes: Option<u64>,
+}
+
+fn lmstudio_response_job_id(resp: &LmStudioDownloadResponse) -> Option<&str> {
+    resp.job_id.as_deref().filter(|job_id| !job_id.is_empty())
 }
 
 #[derive(serde::Deserialize)]
@@ -1845,6 +1856,152 @@ struct LmStudioDownloadStatus {
     downloaded_bytes: Option<u64>,
     #[serde(default)]
     total_size_bytes: Option<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LmStudioDownloadTerminalStatus {
+    Done,
+    Failed,
+}
+
+fn lmstudio_download_status_percent(st: &LmStudioDownloadStatus) -> Option<f64> {
+    st.progress
+        .map(|p| p * 100.0)
+        .or_else(|| match (st.downloaded_bytes, st.total_size_bytes) {
+            (Some(dl), Some(total)) if total > 0 => Some(dl as f64 / total as f64 * 100.0),
+            _ => None,
+        })
+}
+
+fn lmstudio_download_terminal_status(status: &str) -> Option<LmStudioDownloadTerminalStatus> {
+    match status {
+        "completed" | "already_downloaded" => Some(LmStudioDownloadTerminalStatus::Done),
+        "failed" => Some(LmStudioDownloadTerminalStatus::Failed),
+        _ => None,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LmStudioStatusPollResult {
+    Finished,
+    Fallback,
+}
+
+fn poll_lmstudio_download_status(
+    status_url: &str,
+    api_key: Option<&str>,
+    tx: &std::sync::mpsc::Sender<PullEvent>,
+    poll_interval: std::time::Duration,
+    max_polls: usize,
+) -> LmStudioStatusPollResult {
+    let _ = tx.send(PullEvent::Progress {
+        status: "Downloading via LM Studio (tracking status)...".to_string(),
+        percent: None,
+    });
+
+    for _ in 0..max_polls {
+        std::thread::sleep(poll_interval);
+
+        let mut req = ureq::get(status_url)
+            .config()
+            .timeout_global(Some(std::time::Duration::from_secs(5)))
+            .build();
+        if let Some(key) = api_key {
+            req = req.header("Authorization", &format!("Bearer {}", key));
+        }
+        let Ok(resp) = req.call() else {
+            return LmStudioStatusPollResult::Fallback;
+        };
+
+        let Ok(st) = resp.into_body().read_json::<LmStudioDownloadStatus>() else {
+            return LmStudioStatusPollResult::Fallback;
+        };
+
+        match lmstudio_download_terminal_status(&st.status) {
+            Some(LmStudioDownloadTerminalStatus::Done) => {
+                let _ = tx.send(PullEvent::Progress {
+                    status: "Download complete".to_string(),
+                    percent: Some(100.0),
+                });
+                let _ = tx.send(PullEvent::Done);
+                return LmStudioStatusPollResult::Finished;
+            }
+            Some(LmStudioDownloadTerminalStatus::Failed) => {
+                let _ = tx.send(PullEvent::Error("LM Studio download failed".to_string()));
+                return LmStudioStatusPollResult::Finished;
+            }
+            None => {
+                let _ = tx.send(PullEvent::Progress {
+                    status: "Downloading via LM Studio...".to_string(),
+                    percent: lmstudio_download_status_percent(&st),
+                });
+            }
+        }
+    }
+
+    let _ = tx.send(PullEvent::Error("LM Studio download timed out".to_string()));
+    LmStudioStatusPollResult::Finished
+}
+
+fn poll_lmstudio_installed_models(
+    models_url: &str,
+    api_key: Option<&str>,
+    model_tag: &str,
+    tx: &std::sync::mpsc::Sender<PullEvent>,
+    poll_interval: std::time::Duration,
+    max_polls: usize,
+) {
+    let candidates = hf_name_to_lmstudio_candidates(model_tag);
+
+    let _ = tx.send(PullEvent::Progress {
+        status: "Downloading via LM Studio (tracking)...".to_string(),
+        percent: None,
+    });
+
+    for poll_num in 0..max_polls {
+        std::thread::sleep(poll_interval);
+
+        let mut req = ureq::get(models_url)
+            .config()
+            .timeout_global(Some(std::time::Duration::from_secs(5)))
+            .build();
+        if let Some(key) = api_key {
+            req = req.header("Authorization", &format!("Bearer {}", key));
+        }
+        let Ok(resp) = req.call() else {
+            continue;
+        };
+
+        let Ok(list) = resp.into_body().read_json::<LmStudioModelList>() else {
+            continue;
+        };
+
+        let installed: HashSet<String> =
+            list.data.into_iter().map(|m| m.id.to_lowercase()).collect();
+
+        for candidate in &candidates {
+            if installed.contains(candidate.as_str()) {
+                let _ = tx.send(PullEvent::Progress {
+                    status: "Download complete".to_string(),
+                    percent: Some(100.0),
+                });
+                let _ = tx.send(PullEvent::Done);
+                return;
+            }
+        }
+
+        // Send periodic progress so the UI knows we're still tracking the
+        // background download.
+        if poll_num % 10 == 9 {
+            let elapsed_secs = (poll_num + 1) as u64 * poll_interval.as_secs();
+            let _ = tx.send(PullEvent::Progress {
+                status: format!("Downloading via LM Studio ({}s elapsed)...", elapsed_secs),
+                percent: None,
+            });
+        }
+    }
+
+    let _ = tx.send(PullEvent::Error("LM Studio download timed out".to_string()));
 }
 
 impl ModelProvider for LmStudioProvider {
@@ -1871,6 +2028,10 @@ impl ModelProvider for LmStudioProvider {
     fn start_pull(&self, model_tag: &str) -> Result<PullHandle, String> {
         let download_url = self.download_url();
         let models_url = self.models_url();
+        let status_url_builder = LmStudioProvider {
+            base_url: self.base_url.clone(),
+            api_key: None,
+        };
         let api_key = self.api_key.clone();
         let tag = match lmstudio_pull_tag(model_tag) {
             Some(t) => t,
@@ -1894,8 +2055,8 @@ impl ModelProvider for LmStudioProvider {
             // LM Studio may stream download progress as newline-delimited JSON
             // from the POST response, or it may acknowledge the request and
             // close the stream while the download proceeds in the background.
-            // In the latter case we poll the installed models list to detect
-            // eventual completion.
+            // In the latter case we poll the per-job status endpoint when a
+            // job id is available, falling back to the installed models list.
             let mut req = ureq::post(&download_url)
                 .config()
                 .timeout_global(Some(std::time::Duration::from_secs(3600)))
@@ -1911,6 +2072,7 @@ impl ModelProvider for LmStudioProvider {
                     use std::io::BufRead;
 
                     let mut saw_completion = false;
+                    let mut job_id: Option<String> = None;
                     for line in reader.lines() {
                         let Ok(line) = line else { break };
                         if line.is_empty() {
@@ -1920,6 +2082,13 @@ impl ModelProvider for LmStudioProvider {
                         // Handle SSE "data: {json}" or plain JSON lines
                         let json_str = line.strip_prefix("data: ").unwrap_or(&line);
 
+                        if let Ok(dl_resp) =
+                            serde_json::from_str::<LmStudioDownloadResponse>(json_str)
+                            && let Some(id) = lmstudio_response_job_id(&dl_resp)
+                        {
+                            job_id = Some(id.to_string());
+                        }
+
                         // Try single status object, then first element of an array
                         let status_opt: Option<LmStudioDownloadStatus> =
                             serde_json::from_str(json_str).ok().or_else(|| {
@@ -1928,7 +2097,7 @@ impl ModelProvider for LmStudioProvider {
                                     .and_then(|v| v.into_iter().next())
                             });
 
-                        // Also try the initial response format (has job_id)
+                        // Also try the initial response format.
                         if status_opt.is_none() {
                             if let Ok(dl_resp) =
                                 serde_json::from_str::<LmStudioDownloadResponse>(json_str)
@@ -1962,99 +2131,62 @@ impl ModelProvider for LmStudioProvider {
 
                         let st = status_opt.unwrap();
 
-                        let percent = st.progress.map(|p| p * 100.0).or_else(|| {
-                            match (st.downloaded_bytes, st.total_size_bytes) {
-                                (Some(dl), Some(total)) if total > 0 => {
-                                    Some(dl as f64 / total as f64 * 100.0)
-                                }
-                                _ => None,
+                        match lmstudio_download_terminal_status(&st.status) {
+                            Some(LmStudioDownloadTerminalStatus::Done) => {
+                                let _ = tx.send(PullEvent::Progress {
+                                    status: "Download complete".to_string(),
+                                    percent: Some(100.0),
+                                });
+                                let _ = tx.send(PullEvent::Done);
+                                saw_completion = true;
+                                break;
                             }
-                        });
-
-                        if st.status == "completed" || st.status == "already_downloaded" {
-                            let _ = tx.send(PullEvent::Progress {
-                                status: "Download complete".to_string(),
-                                percent: Some(100.0),
-                            });
-                            let _ = tx.send(PullEvent::Done);
-                            saw_completion = true;
-                            break;
-                        }
-
-                        if st.status == "failed" {
-                            let _ =
-                                tx.send(PullEvent::Error("LM Studio download failed".to_string()));
-                            return;
+                            Some(LmStudioDownloadTerminalStatus::Failed) => {
+                                let _ = tx.send(PullEvent::Error(
+                                    "LM Studio download failed".to_string(),
+                                ));
+                                return;
+                            }
+                            None => {}
                         }
 
                         let _ = tx.send(PullEvent::Progress {
                             status: "Downloading via LM Studio...".to_string(),
-                            percent,
+                            percent: lmstudio_download_status_percent(&st),
                         });
                     }
 
                     if !saw_completion {
                         // Stream ended without a completion event. The POST
                         // succeeded so LM Studio accepted the request — it
-                        // is likely downloading in the background. Poll the
-                        // installed models list to detect completion.
-                        let candidates = hf_name_to_lmstudio_candidates(&model_tag_owned);
+                        // is likely downloading in the background. Poll
+                        // per-job status when possible; otherwise fall back
+                        // to the installed models list to detect completion.
                         let poll_interval = std::time::Duration::from_secs(3);
                         let max_polls = 600; // 30 minutes max
 
-                        let _ = tx.send(PullEvent::Progress {
-                            status: "Downloading via LM Studio (tracking)...".to_string(),
-                            percent: None,
-                        });
-
-                        for poll_num in 0..max_polls {
-                            std::thread::sleep(poll_interval);
-
-                            let mut req = ureq::get(&models_url)
-                                .config()
-                                .timeout_global(Some(std::time::Duration::from_secs(5)))
-                                .build();
-                            if let Some(ref key) = api_key {
-                                req = req.header("Authorization", &format!("Bearer {}", key));
-                            }
-                            let Ok(resp) = req.call() else {
-                                continue;
-                            };
-
-                            let Ok(list) = resp.into_body().read_json::<LmStudioModelList>() else {
-                                continue;
-                            };
-
-                            let installed: HashSet<String> =
-                                list.data.into_iter().map(|m| m.id.to_lowercase()).collect();
-
-                            for candidate in &candidates {
-                                if installed.contains(candidate.as_str()) {
-                                    let _ = tx.send(PullEvent::Progress {
-                                        status: "Download complete".to_string(),
-                                        percent: Some(100.0),
-                                    });
-                                    let _ = tx.send(PullEvent::Done);
-                                    return;
-                                }
-                            }
-
-                            // Send periodic progress so the UI knows we're
-                            // still tracking the background download.
-                            if poll_num % 10 == 9 {
-                                let elapsed_secs = (poll_num + 1) as u64 * poll_interval.as_secs();
-                                let _ = tx.send(PullEvent::Progress {
-                                    status: format!(
-                                        "Downloading via LM Studio ({}s elapsed)...",
-                                        elapsed_secs
-                                    ),
-                                    percent: None,
-                                });
+                        if let Some(ref job_id) = job_id {
+                            let status_url = status_url_builder.download_status_url(job_id);
+                            if poll_lmstudio_download_status(
+                                &status_url,
+                                api_key.as_deref(),
+                                &tx,
+                                poll_interval,
+                                max_polls,
+                            ) == LmStudioStatusPollResult::Finished
+                            {
+                                return;
                             }
                         }
 
-                        let _ =
-                            tx.send(PullEvent::Error("LM Studio download timed out".to_string()));
+                        poll_lmstudio_installed_models(
+                            &models_url,
+                            api_key.as_deref(),
+                            &model_tag_owned,
+                            &tx,
+                            poll_interval,
+                            max_polls,
+                        );
                     }
                 }
                 Err(e) => {
@@ -3532,6 +3664,78 @@ mod tests {
         );
         // Empty string → None (must not produce Some(""))
         assert!(filter_key(Some("")).is_none());
+    }
+
+    #[test]
+    fn test_lmstudio_download_status_url_formats_base_urls() {
+        let default_provider = LmStudioProvider {
+            base_url: "http://127.0.0.1:1234".to_string(),
+            api_key: None,
+        };
+        assert_eq!(
+            default_provider.download_status_url("abc123"),
+            "http://127.0.0.1:1234/api/v1/models/download/status/abc123"
+        );
+
+        let custom_provider = LmStudioProvider {
+            base_url: "http://lmstudio.example.test:4321/".to_string(),
+            api_key: None,
+        };
+        assert_eq!(
+            custom_provider.download_status_url("job-42"),
+            "http://lmstudio.example.test:4321/api/v1/models/download/status/job-42"
+        );
+    }
+
+    #[test]
+    fn test_lmstudio_download_response_parses_optional_job_id() {
+        let with_job: LmStudioDownloadResponse =
+            serde_json::from_str(r#"{"job_id":"abc123","status":"download_started"}"#).unwrap();
+        assert_eq!(lmstudio_response_job_id(&with_job), Some("abc123"));
+
+        let without_job: LmStudioDownloadResponse =
+            serde_json::from_str(r#"{"status":"download_started"}"#).unwrap();
+        assert_eq!(lmstudio_response_job_id(&without_job), None);
+    }
+
+    #[test]
+    fn test_lmstudio_download_status_percent_and_terminal_mapping() {
+        let progress: LmStudioDownloadStatus =
+            serde_json::from_str(r#"{"status":"downloading","progress":0.42}"#).unwrap();
+        assert_eq!(lmstudio_download_status_percent(&progress), Some(42.0));
+        assert_eq!(lmstudio_download_terminal_status(&progress.status), None);
+
+        assert_eq!(
+            lmstudio_download_terminal_status("completed"),
+            Some(LmStudioDownloadTerminalStatus::Done)
+        );
+        assert_eq!(
+            lmstudio_download_terminal_status("already_downloaded"),
+            Some(LmStudioDownloadTerminalStatus::Done)
+        );
+        assert_eq!(
+            lmstudio_download_terminal_status("failed"),
+            Some(LmStudioDownloadTerminalStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn test_lmstudio_status_poll_error_falls_back_without_error() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let result = poll_lmstudio_download_status(
+            "http://127.0.0.1:1/api/v1/models/download/status/abc123",
+            None,
+            &tx,
+            std::time::Duration::from_millis(0),
+            1,
+        );
+
+        assert_eq!(result, LmStudioStatusPollResult::Fallback);
+        assert!(
+            !rx.try_iter()
+                .any(|event| matches!(event, PullEvent::Error(_))),
+            "status polling errors must fall back instead of emitting an error"
+        );
     }
 
     #[test]
