@@ -688,8 +688,26 @@ mod tests {
                 avg_output_tokens: 104.0,
             },
         };
+        // llama-server results are labeled "llamacpp" — must be schema-valid too.
+        let llamacpp_result = BenchResult {
+            model: "qwen2.5-7b-q4_k_m".to_string(),
+            provider: "llamacpp".to_string(),
+            runs: vec![],
+            summary: BenchSummary {
+                num_runs: 3,
+                avg_ttft_ms: None,
+                avg_tps: 42.5,
+                min_tps: 40.0,
+                max_tps: 45.0,
+                avg_total_ms: 2400.0,
+                avg_output_tokens: 100.0,
+            },
+        };
 
-        let submission = build_submission(&[result], &specs_with_gpu("NVIDIA GeForce RTX 4090"));
+        let submission = build_submission(
+            &[result, llamacpp_result],
+            &specs_with_gpu("NVIDIA GeForce RTX 4090"),
+        );
         let value = serde_json::to_value(&submission).unwrap();
 
         let schema_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -785,7 +785,7 @@ AGENT USAGE:
         /// Model name to benchmark (auto-detects provider if omitted)
         model: Option<String>,
 
-        /// Provider to benchmark (auto, ollama, vllm, mlx)
+        /// Provider to benchmark (auto, ollama, vllm, mlx, llamacpp)
         #[arg(long, default_value = "auto")]
         provider: String,
 
@@ -2017,6 +2017,7 @@ fn target_info(target: &bench::BenchTarget) -> (&str, &str, &str) {
         bench::BenchTarget::Ollama { url, model } => ("Ollama", url.as_str(), model.as_str()),
         bench::BenchTarget::VLlm { url, model } => ("vLLM", url.as_str(), model.as_str()),
         bench::BenchTarget::Mlx { url, model } => ("MLX", url.as_str(), model.as_str()),
+        bench::BenchTarget::LlamaCpp { url, model } => ("llama.cpp", url.as_str(), model.as_str()),
     }
 }
 
@@ -2049,7 +2050,7 @@ fn run_bench(
     if all {
         let targets = bench::discover_all_targets();
         if targets.is_empty() {
-            eprintln!("No providers or models found. Start Ollama, vLLM, or MLX first.");
+            eprintln!("No providers or models found. Start Ollama, vLLM, MLX, or llama-server first.");
             std::process::exit(1);
         }
 
@@ -2088,6 +2089,9 @@ fn run_bench(
                 }
                 bench::BenchTarget::Mlx { url, model } => {
                     bench::bench_openai_compat(url, model, "mlx", runs, &progress)
+                }
+                bench::BenchTarget::LlamaCpp { url, model } => {
+                    bench::bench_openai_compat(url, model, "llamacpp", runs, &progress)
                 }
             };
 
@@ -2176,6 +2180,28 @@ fn run_bench(
                 model: model_name,
             }
         }
+        "llamacpp" | "llama.cpp" | "llama-server" => {
+            let url = url_override.clone().unwrap_or_else(bench::llamacpp_url);
+            match bench::detect_model_from_url(&url, model.as_deref()) {
+                Ok(model_name) => bench::BenchTarget::LlamaCpp {
+                    url,
+                    model: model_name,
+                },
+                Err(_) => {
+                    let model_name = model.unwrap_or_else(|| {
+                        eprintln!(
+                            "Error: could not detect model from llama-server at {}. Use --model",
+                            url
+                        );
+                        std::process::exit(1);
+                    });
+                    bench::BenchTarget::LlamaCpp {
+                        url,
+                        model: model_name,
+                    }
+                }
+            }
+        }
         _ => match bench::auto_detect_target(model.as_deref()) {
             Ok(t) => t,
             Err(e) => {
@@ -2208,6 +2234,9 @@ fn run_bench(
         }
         bench::BenchTarget::Mlx { url, model } => {
             bench::bench_openai_compat(url, model, "mlx", runs, &progress)
+        }
+        bench::BenchTarget::LlamaCpp { url, model } => {
+            bench::bench_openai_compat(url, model, "llamacpp", runs, &progress)
         }
     };
 
@@ -2326,7 +2355,7 @@ fn run_quality_bench(
     let targets: Vec<bench::BenchTarget> = if all {
         let all_targets = bench::discover_all_targets();
         if all_targets.is_empty() {
-            eprintln!("No providers or models found. Start Ollama, vLLM, or MLX first.");
+            eprintln!("No providers or models found. Start Ollama, vLLM, MLX, or llama-server first.");
             std::process::exit(1);
         }
         if skip_patterns.is_empty() {
@@ -2396,6 +2425,28 @@ fn run_quality_bench(
                     model: model_name,
                 }
             }
+            "llamacpp" | "llama.cpp" | "llama-server" => {
+                let url = url_override.clone().unwrap_or_else(bench::llamacpp_url);
+                match bench::detect_model_from_url(&url, model.as_deref()) {
+                    Ok(model_name) => bench::BenchTarget::LlamaCpp {
+                        url,
+                        model: model_name,
+                    },
+                    Err(_) => {
+                        let model_name = model.unwrap_or_else(|| {
+                            eprintln!(
+                                "Error: could not detect model from llama-server at {}. Use --model",
+                                url
+                            );
+                            std::process::exit(1);
+                        });
+                        bench::BenchTarget::LlamaCpp {
+                            url,
+                            model: model_name,
+                        }
+                    }
+                }
+            }
             _ => match bench::auto_detect_target(model.as_deref()) {
                 Ok(t) => t,
                 Err(e) => {
@@ -2434,7 +2485,9 @@ fn run_quality_bench(
             bench::BenchTarget::Ollama { url, model } => {
                 quality::bench_quality_ollama(url, model, &config, rf)
             }
-            bench::BenchTarget::VLlm { url, model } | bench::BenchTarget::Mlx { url, model } => {
+            bench::BenchTarget::VLlm { url, model }
+            | bench::BenchTarget::Mlx { url, model }
+            | bench::BenchTarget::LlamaCpp { url, model } => {
                 quality::bench_quality_openai_compat(url, model, provider_name, &config, rf)
             }
         };
