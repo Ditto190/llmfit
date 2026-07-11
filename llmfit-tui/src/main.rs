@@ -23,6 +23,7 @@ use llmfit_core::hardware::SystemSpecs;
 use llmfit_core::models::ModelDatabase;
 use llmfit_core::plan::{PlanRequest, estimate_model_plan, resolve_model_selector};
 use llmfit_core::quality;
+use llmfit_core::share;
 
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
     let parsed = value
@@ -167,6 +168,12 @@ struct Cli {
     /// Falls back to OLLAMA_CONTEXT_LENGTH if not set.
     #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u32).range(1..))]
     max_context: Option<u32>,
+
+    /// Force the interactive TUI, ignoring any subcommand or output flags.
+    /// Useful in Docker where a baked-in CMD would otherwise run a subcommand:
+    /// docker run --rm -it ghcr.io/alexsjones/llmfit --tui
+    #[arg(long, global = true)]
+    tui: bool,
 
     /// Do not auto-start the background dashboard server
     #[arg(long, global = true)]
@@ -549,7 +556,7 @@ AGENT USAGE:
         #[arg(long, value_name = "RUNTIME")]
         force_runtime: Option<String>,
 
-        /// Filter by capability: vision, tool_use (comma-separated for multiple)
+        /// Filter by capability: vision, tool_use, audio, tts (comma-separated)
         #[arg(long, value_name = "CAPS")]
         capability: Option<String>,
 
@@ -778,7 +785,7 @@ AGENT USAGE:
         /// Model name to benchmark (auto-detects provider if omitted)
         model: Option<String>,
 
-        /// Provider to benchmark (auto, ollama, vllm, mlx)
+        /// Provider to benchmark (auto, ollama, vllm, mlx, llamacpp)
         #[arg(long, default_value = "auto")]
         provider: String,
 
@@ -817,6 +824,21 @@ AGENT USAGE:
         /// Skip specific models by name substring (comma-separated)
         #[arg(long)]
         skip: Option<String>,
+
+        /// Contribute results back to the project as a GitHub pull request
+        /// (no `gh` CLI required; authenticates via the GitHub device flow).
+        /// Shares all locally stored benchmarks; alone (no model, no --all)
+        /// it uploads the stored backlog without benchmarking
+        #[arg(long)]
+        share: bool,
+
+        /// With --share, print the submission payload and exit without contacting GitHub
+        #[arg(long)]
+        dry_run: bool,
+
+        /// With --share, skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -1420,11 +1442,14 @@ fn run_recommend(
 
     // Filter by capability if specified
     if let Some(ref caps_str) = capability {
-        let requested: Vec<&str> = caps_str.split(',').map(|s| s.trim()).collect();
-        fits.retain(|f| {
-            requested
-                .iter()
-                .all(|req| match req.to_lowercase().as_str() {
+        let requested: Vec<String> = caps_str
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !requested.is_empty() {
+            fits.retain(|f| {
+                requested.iter().all(|req| match req.as_str() {
                     "vision" => f
                         .model
                         .capabilities
@@ -1433,9 +1458,18 @@ fn run_recommend(
                         .model
                         .capabilities
                         .contains(&llmfit_core::models::Capability::ToolUse),
-                    _ => true,
+                    "audio" => f
+                        .model
+                        .capabilities
+                        .contains(&llmfit_core::models::Capability::Audio),
+                    "tts" | "text-to-speech" | "text_to_speech" => f
+                        .model
+                        .capabilities
+                        .contains(&llmfit_core::models::Capability::Tts),
+                    _ => false,
                 })
-        });
+            });
+        }
     }
 
     // Filter by license if specified
@@ -1985,6 +2019,7 @@ fn target_info(target: &bench::BenchTarget) -> (&str, &str, &str) {
         bench::BenchTarget::Ollama { url, model } => ("Ollama", url.as_str(), model.as_str()),
         bench::BenchTarget::VLlm { url, model } => ("vLLM", url.as_str(), model.as_str()),
         bench::BenchTarget::Mlx { url, model } => ("MLX", url.as_str(), model.as_str()),
+        bench::BenchTarget::LlamaCpp { url, model } => ("llama.cpp", url.as_str(), model.as_str()),
     }
 }
 
@@ -2000,6 +2035,7 @@ fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_bench(
     model: Option<String>,
     provider: &str,
@@ -2007,14 +2043,31 @@ fn run_bench(
     runs: u32,
     all: bool,
     json: bool,
+    share_opts: Option<share::ShareOptions>,
+    overrides: &HardwareOverrides,
 ) {
     let runs = runs as usize;
+
+    // With --share, resolve and verify GitHub credentials up front so a
+    // missing or expired token surfaces before minutes of benchmarking.
+    let share_token = match &share_opts {
+        Some(opts) if !opts.dry_run => match share::preflight_auth() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!("Error: --share: {e}");
+                std::process::exit(1);
+            }
+        },
+        _ => None,
+    };
 
     // --all mode: discover and bench every available model
     if all {
         let targets = bench::discover_all_targets();
         if targets.is_empty() {
-            eprintln!("No providers or models found. Start Ollama, vLLM, or MLX first.");
+            eprintln!(
+                "No providers or models found. Start Ollama, vLLM, MLX, or llama-server first."
+            );
             std::process::exit(1);
         }
 
@@ -2054,6 +2107,9 @@ fn run_bench(
                 bench::BenchTarget::Mlx { url, model } => {
                     bench::bench_openai_compat(url, model, "mlx", runs, &progress)
                 }
+                bench::BenchTarget::LlamaCpp { url, model } => {
+                    bench::bench_openai_compat(url, model, "llamacpp", runs, &progress)
+                }
             };
 
             if !json {
@@ -2080,6 +2136,10 @@ fn run_bench(
                 "results": results,
             });
             println!("{}", serde_json::to_string_pretty(&json_out).unwrap());
+        }
+        store_bench_results(&results, overrides, share_opts.is_none());
+        if let Some(opts) = share_opts {
+            share_pending_cli(&opts, share_token);
         }
         return;
     }
@@ -2138,6 +2198,28 @@ fn run_bench(
                 model: model_name,
             }
         }
+        "llamacpp" | "llama.cpp" | "llama-server" => {
+            let url = url_override.clone().unwrap_or_else(bench::llamacpp_url);
+            match bench::detect_model_from_url(&url, model.as_deref()) {
+                Ok(model_name) => bench::BenchTarget::LlamaCpp {
+                    url,
+                    model: model_name,
+                },
+                Err(_) => {
+                    let model_name = model.unwrap_or_else(|| {
+                        eprintln!(
+                            "Error: could not detect model from llama-server at {}. Use --model",
+                            url
+                        );
+                        std::process::exit(1);
+                    });
+                    bench::BenchTarget::LlamaCpp {
+                        url,
+                        model: model_name,
+                    }
+                }
+            }
+        }
         _ => match bench::auto_detect_target(model.as_deref()) {
             Ok(t) => t,
             Err(e) => {
@@ -2171,6 +2253,9 @@ fn run_bench(
         bench::BenchTarget::Mlx { url, model } => {
             bench::bench_openai_compat(url, model, "mlx", runs, &progress)
         }
+        bench::BenchTarget::LlamaCpp { url, model } => {
+            bench::bench_openai_compat(url, model, "llamacpp", runs, &progress)
+        }
     };
 
     if !json {
@@ -2185,9 +2270,68 @@ fn run_bench(
             } else {
                 r.display();
             }
+            store_bench_results(std::slice::from_ref(&r), overrides, share_opts.is_none());
+            if let Some(opts) = share_opts {
+                share_pending_cli(&opts, share_token);
+            }
         }
         Err(e) => {
             eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Record successful benchmark results in the local store. With `hint`, tells
+/// the user where they went and how to contribute them later.
+fn store_bench_results(results: &[bench::BenchResult], overrides: &HardwareOverrides, hint: bool) {
+    if results.is_empty() {
+        return;
+    }
+    let specs = detect_specs(overrides);
+    match share::store_local(results, &specs) {
+        Ok(_) => {
+            if hint {
+                let pending = share::pending_benchmarks().len();
+                eprintln!(
+                    "\n  Results saved locally ({pending} submission(s) pending). \
+                     Contribute them any time with `llmfit bench --share`."
+                );
+            }
+        }
+        Err(e) => eprintln!("  Warning: could not save results locally: {e}"),
+    }
+}
+
+/// Contribute everything in the local pending store as a single PR.
+fn share_pending_cli(opts: &share::ShareOptions, token: Option<String>) {
+    match share::share_all_pending(opts, token) {
+        Ok(Some(outcome)) => {
+            if outcome.skipped > 0 {
+                eprintln!(
+                    "\n  {} previously submitted result(s) were skipped.",
+                    outcome.skipped
+                );
+            }
+            match (&outcome.pr_url, outcome.reused_existing_pr) {
+                (Some(url), true) => println!(
+                    "\n  Added {} submission(s) to your open pull request: {url}",
+                    outcome.uploaded
+                ),
+                (Some(url), false) => println!("\n  Pull request opened: {url}"),
+                (None, _) => println!(
+                    "\n  All stored results were already contributed upstream — nothing new to submit."
+                ),
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("  Share failed: {e}");
+            if !share::pending_benchmarks().is_empty() {
+                eprintln!(
+                    "  Your results remain stored locally; retry with `llmfit bench --share`."
+                );
+            }
             std::process::exit(1);
         }
     }
@@ -2264,7 +2408,9 @@ fn run_quality_bench(
     let targets: Vec<bench::BenchTarget> = if all {
         let all_targets = bench::discover_all_targets();
         if all_targets.is_empty() {
-            eprintln!("No providers or models found. Start Ollama, vLLM, or MLX first.");
+            eprintln!(
+                "No providers or models found. Start Ollama, vLLM, MLX, or llama-server first."
+            );
             std::process::exit(1);
         }
         if skip_patterns.is_empty() {
@@ -2334,6 +2480,28 @@ fn run_quality_bench(
                     model: model_name,
                 }
             }
+            "llamacpp" | "llama.cpp" | "llama-server" => {
+                let url = url_override.clone().unwrap_or_else(bench::llamacpp_url);
+                match bench::detect_model_from_url(&url, model.as_deref()) {
+                    Ok(model_name) => bench::BenchTarget::LlamaCpp {
+                        url,
+                        model: model_name,
+                    },
+                    Err(_) => {
+                        let model_name = model.unwrap_or_else(|| {
+                            eprintln!(
+                                "Error: could not detect model from llama-server at {}. Use --model",
+                                url
+                            );
+                            std::process::exit(1);
+                        });
+                        bench::BenchTarget::LlamaCpp {
+                            url,
+                            model: model_name,
+                        }
+                    }
+                }
+            }
             _ => match bench::auto_detect_target(model.as_deref()) {
                 Ok(t) => t,
                 Err(e) => {
@@ -2372,7 +2540,9 @@ fn run_quality_bench(
             bench::BenchTarget::Ollama { url, model } => {
                 quality::bench_quality_ollama(url, model, &config, rf)
             }
-            bench::BenchTarget::VLlm { url, model } | bench::BenchTarget::Mlx { url, model } => {
+            bench::BenchTarget::VLlm { url, model }
+            | bench::BenchTarget::Mlx { url, model }
+            | bench::BenchTarget::LlamaCpp { url, model } => {
                 quality::bench_quality_openai_compat(url, model, provider_name, &config, rf)
             }
         };
@@ -2565,14 +2735,25 @@ fn main() {
         cpu_cores: cli.cpu_cores,
     };
     let auto_dashboard = !cli.no_dashboard
-        && !cli.json
-        && !matches!(cli.command.as_ref(), Some(Commands::Serve { .. }));
+        && (cli.tui
+            || (!cli.json && !matches!(cli.command.as_ref(), Some(Commands::Serve { .. }))));
 
     let _dashboard_guard = if auto_dashboard {
         ensure_dashboard_available(&overrides, context_limit)
     } else {
         None
     };
+
+    // --tui forces the interactive TUI regardless of any subcommand or
+    // output flags, so a Docker image with a baked-in CMD can still launch
+    // the TUI: docker run --rm -it ghcr.io/alexsjones/llmfit --tui
+    if cli.tui {
+        if let Err(e) = run_tui(&overrides, context_limit, cli.api_key) {
+            eprintln!("Error running TUI: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // If a subcommand is given, use classic CLI mode
     if let Some(command) = cli.command {
@@ -2706,7 +2887,13 @@ fn main() {
                     }
                 };
 
-                let fit = ModelFit::analyze_with_context_limit(&models[idx], &specs, context_limit);
+                let mut fit =
+                    ModelFit::analyze_with_context_limit(&models[idx], &specs, context_limit);
+                fit.measured_tps = llmfit_core::benchmarks::measured_tps_for(
+                    &specs,
+                    &fit.model.name,
+                    &fit.best_quant,
+                );
                 if cli.json {
                     display::display_json_fits(&specs, &[fit]);
                 } else {
@@ -2870,9 +3057,12 @@ fn main() {
                 roles,
                 quality_config,
                 skip,
+                share,
+                dry_run,
+                yes,
             } => {
                 // No model/flags → launch bench TUI view
-                let is_bare = model.is_none() && !all && !json && !quality && !routing;
+                let is_bare = model.is_none() && !all && !json && !quality && !routing && !share;
                 if is_bare {
                     if let Err(e) = run_tui_bench(&overrides, context_limit, cli.api_key) {
                         eprintln!("Error running bench TUI: {}", e);
@@ -2890,8 +3080,24 @@ fn main() {
                         quality_config,
                         skip,
                     );
+                } else if share && model.is_none() && !all && provider == "auto" && url.is_none() {
+                    // `llmfit bench --share` with nothing to bench: contribute
+                    // previously stored local benchmarks.
+                    share_pending_cli(
+                        &share::ShareOptions {
+                            dry_run,
+                            assume_yes: yes,
+                        },
+                        None,
+                    );
                 } else {
-                    run_bench(model, &provider, url, runs, all, json);
+                    let share_opts = share.then_some(share::ShareOptions {
+                        dry_run,
+                        assume_yes: yes,
+                    });
+                    run_bench(
+                        model, &provider, url, runs, all, json, share_opts, &overrides,
+                    );
                 }
             }
         }
@@ -2946,6 +3152,7 @@ mod tests {
                 release_date: Some("2025-01-01".to_string()),
                 gguf_sources: vec![],
                 capabilities: vec![],
+                languages: vec![],
                 format: llmfit_core::models::ModelFormat::default(),
                 num_attention_heads: None,
                 num_key_value_heads: None,
@@ -2981,6 +3188,8 @@ mod tests {
             fits_with_turboquant: false,
             effective_context_length: 8192,
             usable_context: 8192,
+            estimate_basis: Default::default(),
+            measured_tps: None,
         }
     }
 
@@ -3033,6 +3242,7 @@ mod tests {
                 release_date: None,
                 gguf_sources: vec![],
                 capabilities: vec![],
+                languages: vec![],
                 format: llmfit_core::models::ModelFormat::default(),
                 num_attention_heads: None,
                 num_key_value_heads: None,
@@ -3064,6 +3274,7 @@ mod tests {
                 release_date: None,
                 gguf_sources: vec![],
                 capabilities: vec![],
+                languages: vec![],
                 format: llmfit_core::models::ModelFormat::default(),
                 num_attention_heads: None,
                 num_key_value_heads: None,

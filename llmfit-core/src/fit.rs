@@ -28,6 +28,11 @@ pub struct CalcConfig {
     /// Scoring weights per use case: (quality, speed, fit, context).
     #[serde(default)]
     pub scoring_weights: ScoringWeights,
+    /// System RAM (DDR) bandwidth in GB/s, used for MoE-offload estimates.
+    /// None = auto: LLMFIT_DDR_BANDWIDTH env var if set, otherwise measured
+    /// once per process, otherwise a conservative 50 GB/s.
+    #[serde(default)]
+    pub ddr_bandwidth_gbps: Option<f64>,
 }
 
 impl Default for CalcConfig {
@@ -37,6 +42,7 @@ impl Default for CalcConfig {
             efficiency: default_efficiency(),
             run_mode_factors: RunModeFactors::default(),
             scoring_weights: ScoringWeights::default(),
+            ddr_bandwidth_gbps: None,
         }
     }
 }
@@ -111,6 +117,7 @@ pub enum InferenceRuntime {
     LlamaCpp, // llama.cpp / Ollama
     Mlx,      // Apple MLX framework
     Vllm,     // vLLM (for AWQ/GPTQ/AutoRound pre-quantized models)
+    Unsupported,
 }
 
 impl InferenceRuntime {
@@ -119,6 +126,7 @@ impl InferenceRuntime {
             InferenceRuntime::LlamaCpp => "llama.cpp",
             InferenceRuntime::Mlx => "MLX",
             InferenceRuntime::Vllm => "vLLM",
+            InferenceRuntime::Unsupported => "unsupported",
         }
     }
 }
@@ -198,6 +206,32 @@ pub struct ScoreComponents {
     pub context: f64,
 }
 
+/// The inputs behind `estimated_tps`, exposed so users can see exactly what
+/// the estimate assumes and reproduce it locally (issue #292).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EstimateBasis {
+    /// `"gpu_bandwidth_roofline"` — derived from the GPU's memory bandwidth;
+    /// `"backend_constant"` — GPU not in the bandwidth table, per-backend
+    /// heuristic constant used; `"cpu_constant"` — CPU-only path;
+    /// `"unsupported"` — no estimate produced.
+    pub method: String,
+    /// GPU memory bandwidth assumed (GB/s), when the roofline path was used.
+    pub gpu_bandwidth_gbps: Option<f64>,
+    /// System RAM bandwidth assumed for MoE expert streaming (GB/s);
+    /// only set for MoE-offload runs.
+    pub ddr_bandwidth_gbps: Option<f64>,
+    /// Efficiency factor applied to raw bandwidth (default 0.55).
+    pub efficiency: f64,
+    /// The estimate models single-request *generation* throughput at this
+    /// context length. Prompt processing (prefill/TTFT) is not estimated.
+    pub assumed_context: u32,
+    /// Correction factor derived from the user's own `llmfit bench` runs on
+    /// this machine (median measured/estimated across trustworthy anchors),
+    /// already applied to `estimated_tps`. `None` when no local runs matched.
+    #[serde(default)]
+    pub local_calibration: Option<f64>,
+}
+
 #[derive(Clone, serde::Serialize)]
 pub struct ModelFit {
     pub model: LlmModel,
@@ -222,6 +256,14 @@ pub struct ModelFit {
     /// A "Perfect" fit with an 8k usable context out of a 262k window is a
     /// very different proposition for coding work (issue #621).
     pub usable_context: u32,
+    /// What the tok/s estimate assumes — method, bandwidths, efficiency —
+    /// so the number can be reproduced and verified (issue #292).
+    pub estimate_basis: EstimateBasis,
+    /// Community-measured throughput on hardware matching this system
+    /// (localmaxxing.com data), when available. Ground truth, displayed
+    /// with priority over `estimated_tps`. Set after analysis, like
+    /// `installed`.
+    pub measured_tps: Option<crate::benchmarks::MeasuredTps>,
 }
 
 impl ModelFit {
@@ -295,6 +337,43 @@ impl ModelFit {
                 "Context capped at {} tokens for estimation (model supports up to {}; use --max-context to override)",
                 estimation_ctx, model.context_length
             ));
+        }
+
+        if model.requires_specialized_runtime() {
+            notes.push(
+                "Requires a specialized TTS runtime; llama.cpp/MLX/vLLM fit is not supported yet"
+                    .to_string(),
+            );
+            return ModelFit {
+                model: model.clone(),
+                fit_level: FitLevel::TooTight,
+                run_mode: RunMode::CpuOnly,
+                memory_required_gb: default_mem_required,
+                memory_available_gb: 0.0,
+                utilization_pct: 0.0,
+                notes,
+                moe_offloaded_gb: None,
+                score: 0.0,
+                score_components: ScoreComponents {
+                    quality: 0.0,
+                    speed: 0.0,
+                    fit: 0.0,
+                    context: 0.0,
+                },
+                estimated_tps: 0.0,
+                best_quant: model.quantization.clone(),
+                use_case,
+                runtime: InferenceRuntime::Unsupported,
+                installed: false,
+                fits_with_turboquant: false,
+                effective_context_length: estimation_ctx,
+                usable_context: 0,
+                estimate_basis: EstimateBasis {
+                    method: "unsupported".to_string(),
+                    ..EstimateBasis::default()
+                },
+                measured_tps: None,
+            };
         }
 
         // Determine inference runtime up front so path selection can use
@@ -457,7 +536,9 @@ impl ModelFit {
             (model.quantization.as_str(), mem_required)
         } else {
             let budget = mem_available;
-            let hierarchy: &[&str] = if runtime == InferenceRuntime::Mlx {
+            let hierarchy: &[&str] = if model.format == models::ModelFormat::Onnx {
+                models::ONNX_QUANT_HIERARCHY
+            } else if runtime == InferenceRuntime::Mlx {
                 models::MLX_QUANT_HIERARCHY
             } else {
                 models::QUANT_HIERARCHY
@@ -487,6 +568,32 @@ impl ModelFit {
         // Speed estimation
         let estimated_tps =
             estimate_tps(model, &best_quant_str, system, run_mode, runtime, &config);
+
+        // Record the estimate's inputs so it can be reproduced (issue #292).
+        // Mirrors the path selection in estimate_tps: bandwidth roofline when
+        // the GPU is recognized, per-backend constant otherwise.
+        let estimate_basis = {
+            let gpu_bw = system
+                .gpu_name
+                .as_deref()
+                .and_then(crate::hardware::gpu_memory_bandwidth_gbps);
+            let method = if run_mode == RunMode::CpuOnly {
+                "cpu_constant"
+            } else if gpu_bw.is_some() {
+                "gpu_bandwidth_roofline"
+            } else {
+                "backend_constant"
+            };
+            EstimateBasis {
+                method: method.to_string(),
+                gpu_bandwidth_gbps: (run_mode != RunMode::CpuOnly).then_some(gpu_bw).flatten(),
+                ddr_bandwidth_gbps: (run_mode == RunMode::MoeOffload)
+                    .then(|| ddr_bandwidth_gbps(&config)),
+                efficiency: config.efficiency,
+                assumed_context: estimation_ctx,
+                local_calibration: None,
+            }
+        };
 
         // Add runtime comparison note on Apple Silicon
         if runtime == InferenceRuntime::Mlx {
@@ -574,6 +681,8 @@ impl ModelFit {
             fits_with_turboquant,
             effective_context_length: estimation_ctx,
             usable_context,
+            estimate_basis,
+            measured_tps: None, // set later, like `installed`
         }
     }
 
@@ -721,7 +830,9 @@ fn moe_offload_path(
     runtime: InferenceRuntime,
     notes: &mut Vec<String>,
 ) -> (RunMode, f64, f64) {
-    let hierarchy: &[&str] = if runtime == InferenceRuntime::Mlx {
+    let hierarchy: &[&str] = if model.format == models::ModelFormat::Onnx {
+        models::ONNX_QUANT_HIERARCHY
+    } else if runtime == InferenceRuntime::Mlx {
         models::MLX_QUANT_HIERARCHY
     } else {
         models::QUANT_HIERARCHY
@@ -818,7 +929,9 @@ fn best_quant_for_runtime_budget(
     if runtime == InferenceRuntime::Vllm {
         return None;
     }
-    let hierarchy: &[&str] = if runtime == InferenceRuntime::Mlx {
+    let hierarchy: &[&str] = if model.format == models::ModelFormat::Onnx {
+        models::ONNX_QUANT_HIERARCHY
+    } else if runtime == InferenceRuntime::Mlx {
         models::MLX_QUANT_HIERARCHY
     } else {
         models::QUANT_HIERARCHY
@@ -835,7 +948,9 @@ fn best_quant_for_runtime_budget(
 }
 
 pub fn backend_compatible(model: &LlmModel, system: &SystemSpecs) -> bool {
-    if model.is_mlx_model() {
+    if model.requires_specialized_runtime() {
+        false
+    } else if model.is_mlx_model() {
         system.backend == GpuBackend::Metal && system.unified_memory
     } else if model.is_prequantized() {
         if !matches!(system.backend, GpuBackend::Cuda | GpuBackend::Rocm) {
@@ -1006,11 +1121,6 @@ pub fn rank_models_by_fit_opts_col(
 ///  - Google, "Efficiently Scaling Transformer Inference" (arXiv:2211.05102)
 ///  - ggerganov, llama.cpp NVIDIA T4 benchmarks (Discussion #4225)
 
-/// Read the system DDR bandwidth (GB/s) from the `LLMFIT_DDR_BANDWIDTH` env var,
-/// falling back to a conservative 50 GB/s default (DDR4-3200 dual-channel).
-///
-/// Override: `export LLMFIT_DDR_BANDWIDTH=90` for DDR5-5600 dual-channel, etc.
-/// Typical values: DDR4-3200 dual-channel ~50 GB/s, DDR5-5600 dual-channel ~90 GB/s.
 /// VRAM utilization threshold above which MoE cache-pressure penalty applies.
 /// Below this, inactive experts don't significantly compete for L2 cache.
 const VRAM_PRESSURE_UTIL_THRESHOLD: f64 = 0.60;
@@ -1034,11 +1144,25 @@ macro_rules! debug_log {
     };
 }
 
-fn ddr_bandwidth_gbps() -> f64 {
-    std::env::var("LLMFIT_DDR_BANDWIDTH")
+/// System DDR bandwidth (GB/s) used for MoE-offload expert streaming.
+///
+/// Resolution order:
+///  1. `CalcConfig::ddr_bandwidth_gbps` (TUI Advanced Config)
+///  2. `LLMFIT_DDR_BANDWIDTH` env var (e.g. `export LLMFIT_DDR_BANDWIDTH=90`)
+///  3. Measured effective bandwidth (`hardware::measured_ram_bandwidth_gbps`)
+///  4. Conservative 50 GB/s fallback (DDR4-3200 dual-channel)
+fn ddr_bandwidth_gbps(config: &CalcConfig) -> f64 {
+    if let Some(bw) = config.ddr_bandwidth_gbps.filter(|b| *b > 0.0) {
+        return bw;
+    }
+    if let Some(bw) = std::env::var("LLMFIT_DDR_BANDWIDTH")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(50.0)
+        .filter(|b| *b > 0.0)
+    {
+        return bw;
+    }
+    crate::hardware::measured_ram_bandwidth_gbps().unwrap_or(50.0)
 }
 
 fn estimate_tps(
@@ -1118,11 +1242,12 @@ fn estimate_tps(
             // ceiling on some systems, but in practice llama.cpp processes
             // offloaded layers on the CPU, so DDR bandwidth is the dominant factor.
             //
-            // Typical DDR bandwidths: DDR4-3200 dual-channel ~50 GB/s,
-            // DDR5-5600 dual-channel ~90 GB/s. We use a conservative 50 GB/s
-            // default which can be overridden via LLMFIT_DDR_BANDWIDTH env var.
+            // DDR bandwidth is resolved per ddr_bandwidth_gbps(): Advanced
+            // Config value, else LLMFIT_DDR_BANDWIDTH env var, else measured
+            // effective bandwidth, else a conservative 50 GB/s (DDR4-3200
+            // dual-channel).
             if run_mode == RunMode::MoeOffload {
-                let ddr_bw = ddr_bandwidth_gbps();
+                let ddr_bw = ddr_bandwidth_gbps(config);
 
                 let expert_read_time = active_gb / ddr_bw; // CPU reads from DDR
                 let gpu_compute_time = active_gb / (bw * efficiency);
@@ -1280,6 +1405,7 @@ fn estimate_tps(
     // Used when the GPU is not recognized (custom/unnamed GPUs,
     // synthetic entries from --memory override, etc.).
     let k: f64 = match (system.backend, runtime) {
+        (_, InferenceRuntime::Unsupported) => 0.0,
         (GpuBackend::Metal, InferenceRuntime::Mlx) => 250.0,
         (GpuBackend::Metal, InferenceRuntime::LlamaCpp) => 160.0,
         (GpuBackend::Metal, InferenceRuntime::Vllm) => 160.0,
@@ -1311,7 +1437,7 @@ fn estimate_tps(
         let estimated_gpu_bw = k * models::quant_bytes_per_param(quant) / fallback_efficiency;
         let bytes_per_param = models::quant_bytes_per_param(quant);
         let active_gb = params * bytes_per_param;
-        let ddr_bw = ddr_bandwidth_gbps();
+        let ddr_bw = ddr_bandwidth_gbps(config);
         let expert_read_time = active_gb / ddr_bw;
         let gpu_compute_time = active_gb / (estimated_gpu_bw * fallback_efficiency);
         base = (1.0 / (expert_read_time + gpu_compute_time)).max(0.1);
@@ -1600,7 +1726,28 @@ mod tests {
 
     /// Test helper: default CalcConfig for direct estimate_tps calls.
     fn test_config() -> CalcConfig {
-        CalcConfig::default()
+        CalcConfig {
+            // Pin DDR bandwidth so MoE-offload estimates don't vary with the
+            // machine running the tests.
+            ddr_bandwidth_gbps: Some(50.0),
+            ..CalcConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_ddr_bandwidth_config_override_wins() {
+        let config = CalcConfig {
+            ddr_bandwidth_gbps: Some(123.0),
+            ..CalcConfig::default()
+        };
+        assert_eq!(ddr_bandwidth_gbps(&config), 123.0);
+
+        // Zero/negative values are invalid and fall through to auto.
+        let config = CalcConfig {
+            ddr_bandwidth_gbps: Some(0.0),
+            ..CalcConfig::default()
+        };
+        assert!(ddr_bandwidth_gbps(&config) > 0.0);
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -1626,6 +1773,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: models::ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -1814,6 +1962,26 @@ mod tests {
     }
 
     #[test]
+    fn test_tts_requires_unsupported_runtime() {
+        let mut model = test_model("82M", 1.0, Some(0.5));
+        model.quantization = "F16".to_string();
+        model.format = models::ModelFormat::Safetensors;
+        model.capabilities = vec![models::Capability::Audio, models::Capability::Tts];
+        let system = test_system(16.0, true, Some(8.0));
+
+        let fit = ModelFit::analyze(&model, &system);
+
+        assert_eq!(fit.runtime, InferenceRuntime::Unsupported);
+        assert_eq!(fit.fit_level, FitLevel::TooTight);
+        assert_eq!(fit.score, 0.0);
+        assert!(
+            fit.notes
+                .iter()
+                .any(|n| n.contains("specialized TTS runtime"))
+        );
+    }
+
+    #[test]
     fn test_moe_offload_tries_lower_quantization() {
         let model = LlmModel {
             name: "MoE Quant Test".to_string(),
@@ -1833,6 +2001,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: models::ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -1877,6 +2046,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: models::ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -2893,6 +3063,16 @@ mod tests {
     }
 
     #[test]
+    fn test_tts_backend_incompatible_until_runtime_supported() {
+        let mut model = test_model("82M", 1.0, Some(0.5));
+        model.format = models::ModelFormat::Safetensors;
+        model.capabilities = vec![models::Capability::Audio, models::Capability::Tts];
+
+        let cuda_sys = test_system(64.0, true, Some(24.0));
+        assert!(!backend_compatible(&model, &cuda_sys));
+    }
+
+    #[test]
     fn test_awq_incompatible_on_volta_v100() {
         // V100 is Volta (cc 7.0) — AWQ requires cc >= 7.5
         let mut model = test_model("7B", 4.0, Some(4.0));
@@ -2991,6 +3171,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: models::ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -3220,7 +3401,9 @@ mod tests {
         // Small VRAM to force MoE offload path
         let system = test_system_with_gpu(64.0, 8.0, "NVIDIA GeForce RTX 4090");
 
-        let fit = ModelFit::analyze(&model, &system);
+        // Pinned DDR bandwidth: the auto-measured value would make this
+        // machine-dependent.
+        let fit = ModelFit::analyze_with_config(&model, &system, test_config());
 
         assert!(
             matches!(fit.run_mode, RunMode::MoeOffload),
@@ -3276,6 +3459,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: models::ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -3559,6 +3743,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: models::ModelFormat::default(),
             num_attention_heads: Some(num_attention_heads),
             num_key_value_heads: Some(num_key_value_heads),

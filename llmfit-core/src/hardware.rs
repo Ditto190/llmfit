@@ -225,6 +225,18 @@ impl SystemSpecs {
             }
         }
 
+        // Intel macOS machines expose Intel and AMD GPUs through Metal, but
+        // not through Linux ROCm/sysfs or NVIDIA-specific tools. Read
+        // system_profiler so older MacBook Pros report their discrete Radeon.
+        for mac_gpu in Self::detect_macos_metal_gpus() {
+            let dominated = gpus
+                .iter()
+                .any(|existing| Self::is_same_gpu_name(&existing.name, &mac_gpu.name));
+            if !dominated {
+                gpus.push(mac_gpu);
+            }
+        }
+
         // Apple Silicon (unified memory)
         if let Some(vram) = Self::detect_apple_gpu(total_ram_gb) {
             let name = if cpu_name.to_lowercase().contains("apple") {
@@ -286,7 +298,11 @@ impl SystemSpecs {
         // integrated GPUs so the discrete GPU becomes primary. This applies
         // globally, not just to the Windows WMI path, to handle cases where
         // an iGPU is detected via Vulkan or APU detection alongside a dGPU.
-        gpus = Self::prefer_discrete_gpus(gpus);
+        // Keep macOS Metal iGPUs visible because Activity Monitor and
+        // llama.cpp's Metal device list can expose both built-in GPUs.
+        if !cfg!(target_os = "macos") {
+            gpus = Self::prefer_discrete_gpus(gpus);
+        }
 
         // Sort by VRAM descending so the best GPU is primary
         gpus.sort_by(|a, b| {
@@ -861,6 +877,13 @@ impl SystemSpecs {
             cards.push((name, vram_gb));
         }
 
+        Self::group_and_filter_amd_sysfs_cards(cards)
+    }
+
+    /// Group sysfs AMD cards by model name and drop integrated GPUs when a
+    /// discrete card is present. Pure so the #303/#638 multi-GPU
+    /// configurations can be regression-tested without a live sysfs.
+    fn group_and_filter_amd_sysfs_cards(cards: Vec<(String, Option<f64>)>) -> Vec<GpuInfo> {
         // Group identical models, tracking count and max per-card VRAM.
         let mut grouped: BTreeMap<String, (u32, Option<f64>)> = BTreeMap::new();
         for (name, vram_gb) in cards {
@@ -873,13 +896,18 @@ impl SystemSpecs {
             }
         }
 
-        // Filter out integrated GPUs when discrete GPUs are present.
+        // Filter out integrated GPUs when discrete GPUs are present. A card
+        // whose VRAM could not be read (None) gets the benefit of the doubt:
+        // only a *known* small VRAM (<= 2 GB) marks a card as
+        // integrated-class. Requiring Some(vram) here silently dropped
+        // discrete cards with an unreadable mem_info_vram_total and a name
+        // missing from the VRAM estimate table.
         let has_discrete = grouped.iter().any(|(name, (_, vram))| {
             !Self::is_integrated_gpu_name(name) && vram.unwrap_or(0.0) > 2.0
         });
         if has_discrete {
             grouped.retain(|name, (_, vram)| {
-                !Self::is_integrated_gpu_name(name) && vram.unwrap_or(0.0) > 2.0
+                !Self::is_integrated_gpu_name(name) && vram.is_none_or(|v| v > 2.0)
             });
         }
 
@@ -914,10 +942,13 @@ impl SystemSpecs {
             }
         }
 
-        // Fallback: any AMD/ATI display controller line.
+        // Fallback: any AMD/ATI display controller line. Headless/secondary
+        // cards (e.g. Instinct MI50s, #638) enumerate as "Display controller",
+        // not "VGA compatible controller", so match all three classes just
+        // like the slot-hint pass above.
         for line in text.lines() {
             let lower = line.to_lowercase();
-            if (lower.contains("vga") || lower.contains("3d"))
+            if (lower.contains("vga") || lower.contains("3d") || lower.contains("display"))
                 && (lower.contains("amd") || lower.contains("ati"))
                 && let Some(model) = Self::extract_model_from_lspci_line(line)
             {
@@ -1375,6 +1406,77 @@ impl SystemSpecs {
         } else {
             None
         }
+    }
+
+    /// Detect macOS Metal GPUs from system_profiler.
+    ///
+    /// This covers Intel Macs with built-in Intel graphics and discrete AMD
+    /// Radeon GPUs. Apple Silicon is intentionally skipped because it is
+    /// handled by `detect_apple_gpu` as unified memory.
+    fn detect_macos_metal_gpus() -> Vec<GpuInfo> {
+        if !cfg!(target_os = "macos") {
+            return Vec::new();
+        }
+
+        let output = std::process::Command::new("system_profiler")
+            .args(["SPDisplaysDataType", "-json"])
+            .output();
+        let Ok(output) = output else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+
+        Self::parse_macos_metal_gpus_from_system_profiler_json(&output.stdout)
+    }
+
+    fn parse_macos_metal_gpus_from_system_profiler_json(data: &[u8]) -> Vec<GpuInfo> {
+        let Ok(json) = serde_json::from_slice::<serde_json::Value>(data) else {
+            return Vec::new();
+        };
+        let Some(displays) = json.get("SPDisplaysDataType").and_then(|v| v.as_array()) else {
+            return Vec::new();
+        };
+        displays
+            .iter()
+            .filter_map(|entry| {
+                let name = entry
+                    .get("sppci_model")
+                    .or_else(|| entry.get("_name"))
+                    .and_then(|v| v.as_str())?
+                    .trim()
+                    .to_string();
+                let lower = name.to_lowercase();
+                if lower.contains("apple m") || lower.contains("apple gpu") {
+                    return None;
+                }
+
+                let metal = entry
+                    .get("spdisplays_mtlgpufamilysupport")
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                if !metal {
+                    return None;
+                }
+
+                let vram_gb = entry
+                    .get("spdisplays_vram")
+                    .or_else(|| entry.get("_spdisplays_vram"))
+                    .or_else(|| entry.get("spdisplays_vram_shared"))
+                    .and_then(|v| v.as_str())
+                    .and_then(parse_memory_size);
+
+                Some(GpuInfo {
+                    name,
+                    vram_gb,
+                    backend: GpuBackend::Metal,
+                    count: 1,
+                    unified_memory: false,
+                })
+            })
+            .collect()
     }
 
     fn has_command(command: &str) -> bool {
@@ -1865,6 +1967,9 @@ impl SystemSpecs {
         println!("CPU: {} ({} cores)", self.cpu_name, self.total_cpu_cores);
         println!("Total RAM: {:.2} GB", self.total_ram_gb);
         println!("Available RAM: {:.2} GB", self.available_ram_gb);
+        if let Some(bw) = measured_ram_bandwidth_gbps() {
+            println!("RAM Bandwidth: ~{bw:.0} GB/s (measured)");
+        }
         println!("Backend: {}", self.backend.label());
 
         if self.gpus.is_empty() {
@@ -2048,6 +2153,68 @@ fn read_proc_meminfo_total_gb() -> Option<f64> {
         }
     }
     None
+}
+
+/// Effective system RAM bandwidth in GB/s, measured once per process with a
+/// short multithreaded memcpy sweep (~100 ms total) and cached.
+///
+/// This is *achievable* streaming bandwidth (STREAM-copy convention: bytes
+/// read + bytes written per pass), which is what MoE-offload expert streaming
+/// actually sees — typically 60–80% of the spec-sheet peak. Returns `None`
+/// if the measurement fails or produces an implausible value; callers should
+/// fall back to a conservative constant.
+pub fn measured_ram_bandwidth_gbps() -> Option<f64> {
+    static MEASURED: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *MEASURED.get_or_init(measure_ram_bandwidth_gbps)
+}
+
+fn measure_ram_bandwidth_gbps() -> Option<f64> {
+    use std::time::{Duration, Instant};
+
+    // Per-thread working set (2 × 32 MiB) must comfortably exceed L3 so we
+    // measure DRAM, not cache. A single thread rarely saturates multi-channel
+    // memory controllers, so spread the sweep across up to 8 cores.
+    const BUF_BYTES: usize = 32 * 1024 * 1024;
+    const MEASURE_WINDOW: Duration = Duration::from_millis(80);
+
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(4);
+
+    let barrier = std::sync::Barrier::new(threads);
+    let per_thread_gbps: Vec<f64> = std::thread::scope(|scope| {
+        let barrier = &barrier;
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(move || {
+                    let src = vec![1u8; BUF_BYTES];
+                    let mut dst = vec![0u8; BUF_BYTES];
+                    // Warmup pass faults pages in before the timed window.
+                    dst.copy_from_slice(&src);
+                    std::hint::black_box(&mut dst);
+                    barrier.wait();
+                    let start = Instant::now();
+                    let mut passes = 0u64;
+                    while start.elapsed() < MEASURE_WINDOW {
+                        dst.copy_from_slice(&src);
+                        std::hint::black_box(&mut dst);
+                        passes += 1;
+                    }
+                    let secs = start.elapsed().as_secs_f64();
+                    (passes as f64) * (2 * BUF_BYTES) as f64 / secs / 1e9
+                })
+            })
+            .collect();
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+
+    if per_thread_gbps.len() != threads {
+        return None;
+    }
+    let total: f64 = per_thread_gbps.iter().sum();
+    // Sanity band: below 2 GB/s means the measurement was starved (heavy
+    // contention, throttled VM); above 4000 GB/s means we measured cache.
+    (2.0..=4000.0).contains(&total).then_some(total)
 }
 
 /// Estimate GPU memory bandwidth in GB/s from the GPU model name.
@@ -2735,6 +2902,64 @@ fn estimate_vram_from_name(name: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::SystemSpecs;
+
+    // Regression for #303 (wezm): Granite Ridge iGPU ("Radeon Graphics",
+    // 2 GB UMA carve-out) enumerated alongside an RX 9060 XT. The iGPU must
+    // be filtered out and the discrete card kept.
+    #[test]
+    fn test_amd_sysfs_igpu_filtered_when_discrete_present() {
+        let gpus = SystemSpecs::group_and_filter_amd_sysfs_cards(vec![
+            ("Radeon Graphics".to_string(), Some(2.0)),
+            ("Radeon RX 9060 XT".to_string(), Some(16.0)),
+        ]);
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].name, "Radeon RX 9060 XT");
+        assert_eq!(gpus[0].vram_gb, Some(16.0));
+        assert!(!SystemSpecs::is_integrated_gpu_name("Radeon RX 9060 XT"));
+    }
+
+    // A discrete card whose mem_info_vram_total is unreadable (None) and
+    // whose name isn't in the VRAM estimate table must not be silently
+    // dropped when another discrete card is present.
+    #[test]
+    fn test_amd_sysfs_vramless_discrete_card_kept() {
+        let gpus = SystemSpecs::group_and_filter_amd_sysfs_cards(vec![
+            ("Radeon RX 7900 XTX".to_string(), Some(24.0)),
+            ("Radeon Pro W7800X Duo".to_string(), None),
+        ]);
+        assert_eq!(gpus.len(), 2, "VRAM-less discrete card was dropped");
+    }
+
+    // Without any discrete card, the iGPU must survive the filter.
+    #[test]
+    fn test_amd_sysfs_igpu_kept_when_alone() {
+        let gpus = SystemSpecs::group_and_filter_amd_sysfs_cards(vec![(
+            "Radeon Graphics".to_string(),
+            Some(2.0),
+        )]);
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].name, "Radeon Graphics");
+    }
+
+    // lspci line for the RX 9060 XT (Navi 44) as seen in #303.
+    #[test]
+    fn test_extract_model_navi44_lspci_line() {
+        let line = "0000:03:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. [AMD/ATI] Navi 44 [Radeon RX 9060 XT] [1002:7590]";
+        assert_eq!(
+            SystemSpecs::extract_model_from_lspci_line(line).as_deref(),
+            Some("Radeon RX 9060 XT")
+        );
+    }
+
+    #[test]
+    fn test_measured_ram_bandwidth_plausible_and_cached() {
+        // May legitimately be None on a starved CI runner; when it measures,
+        // the value must sit in the sanity band and be stable across calls.
+        if let Some(bw) = super::measured_ram_bandwidth_gbps() {
+            assert!((2.0..=4000.0).contains(&bw), "implausible bandwidth: {bw}");
+            assert_eq!(super::measured_ram_bandwidth_gbps(), Some(bw));
+        }
+    }
 
     #[test]
     fn test_parse_nvidia_smi_does_not_sum_multi_gpu_vram() {
@@ -3499,6 +3724,51 @@ GPU id = 1 (NVIDIA GeForce RTX 4090)
         let result = SystemSpecs::prefer_discrete_gpus(gpus);
         assert_eq!(result.len(), 1);
         assert!(result[0].name.contains("UHD"));
+    }
+
+    #[test]
+    fn test_parse_macos_metal_gpus_from_system_profiler_json() {
+        let json = br#"
+        {
+          "SPDisplaysDataType": [
+            {
+              "_name": "Intel HD Graphics 630",
+              "sppci_model": "Intel HD Graphics 630",
+              "spdisplays_mtlgpufamilysupport": "Metal 3",
+              "spdisplays_vram_shared": "1536 MB"
+            },
+            {
+              "_name": "AMD Radeon RX Baffin Prototype",
+              "sppci_model": "Radeon Pro 560",
+              "spdisplays_mtlgpufamilysupport": "Metal 3",
+              "spdisplays_vram": "4 GB"
+            },
+            {
+              "_name": "Display",
+              "sppci_model": "Display",
+              "spdisplays_vram": "0 MB"
+            },
+            {
+              "_name": "Apple M2",
+              "sppci_model": "Apple M2",
+              "spdisplays_mtlgpufamilysupport": "Metal 3",
+              "spdisplays_vram_shared": "16 GB"
+            }
+          ]
+        }
+        "#;
+
+        let gpus = SystemSpecs::parse_macos_metal_gpus_from_system_profiler_json(json);
+
+        assert_eq!(gpus.len(), 2);
+        assert_eq!(gpus[0].name, "Intel HD Graphics 630");
+        assert_eq!(gpus[0].backend, super::GpuBackend::Metal);
+        assert_eq!(gpus[0].vram_gb, Some(1.5));
+        assert!(!gpus[0].unified_memory);
+        assert_eq!(gpus[1].name, "Radeon Pro 560");
+        assert_eq!(gpus[1].backend, super::GpuBackend::Metal);
+        assert_eq!(gpus[1].vram_gb, Some(4.0));
+        assert!(!gpus[1].unified_memory);
     }
 
     #[test]
