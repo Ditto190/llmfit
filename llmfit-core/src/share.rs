@@ -198,7 +198,11 @@ fn now_unix() -> u64 {
 /// failed (e.g. a GPU reported as "N/A" because ROCm/libdrm couldn't name it).
 fn is_placeholder_identity(s: &str) -> bool {
     let t = s.trim().to_lowercase();
-    t.is_empty() || matches!(t.as_str(), "n/a" | "na" | "n-a" | "unknown" | "none" | "null" | "-")
+    t.is_empty()
+        || matches!(
+            t.as_str(),
+            "n/a" | "na" | "n-a" | "unknown" | "none" | "null" | "-"
+        )
 }
 
 /// Whether a stored submission identifies its hardware well enough to be a
